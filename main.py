@@ -12,8 +12,9 @@ from aiogram.types import Message, FSInputFile
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
 
-from config import BOT_TOKEN, MAX_FILE_SIZE
+from config import BOT_TOKEN, MAX_FILE_SIZE, ADMIN_ID
 from downloader import download_video, cleanup
+from db import track_user, increment_downloads, get_stats, get_all_users
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -36,6 +37,8 @@ def format_number(n: int) -> str:
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    track_user(message.from_user.id, message.from_user.username,
+               message.from_user.first_name, message.from_user.last_name)
     await message.answer(
         "Привет! Отправь ссылку на TikTok видео, и я скачаю его для тебя.\n\n"
         "Поддерживаемые форматы ссылок:\n"
@@ -55,8 +58,45 @@ async def cmd_help(message: Message):
     )
 
 
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    s = get_stats()
+    await message.answer(
+        f"Пользователей: {s['total_users']}\n"
+        f"Загрузок: {s['total_downloads']}"
+    )
+
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    users = get_all_users()
+    if not users:
+        await message.answer("Пользователей пока нет.")
+        return
+
+    lines = []
+    for i, u in enumerate(users, 1):
+        name = u["first_name"] or ""
+        if u["last_name"]:
+            name += f" {u['last_name']}"
+        username = f" @{u['username']}" if u["username"] else ""
+        lines.append(f"{i}. {name}{username} | ID: {u['user_id']} | Загрузок: {u['downloads']}")
+
+    text = "\n".join(lines)
+    # Telegram лимит 4096 символов
+    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+        await message.answer(chunk)
+
+
 @dp.message(F.text)
 async def handle_message(message: Message):
+    track_user(message.from_user.id, message.from_user.username,
+               message.from_user.first_name, message.from_user.last_name)
+
     urls = TIKTOK_RE.findall(message.text)
 
     if not urls:
@@ -107,6 +147,7 @@ async def handle_message(message: Message):
                 caption=caption,
             )
             await status.delete()
+            increment_downloads(message.from_user.id)
         except Exception as e:
             log.error("Ошибка отправки: %s", e)
             await status.edit_text("Не удалось отправить видео.")
