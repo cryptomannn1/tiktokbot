@@ -1,41 +1,49 @@
 from __future__ import annotations
 
 import os
-import yt_dlp
+import httpx
 from config import DOWNLOAD_DIR
 
 
-def download_video(url: str) -> dict | None:
-    """Скачать видео. Возвращает dict с path и info или None."""
+async def download_video(url: str) -> dict | None:
+    """Скачать TikTok видео через API. Возвращает dict с path и info."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-    ydl_opts = {
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-    }
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        resp = await client.get(
+            "https://www.tikwm.com/api/",
+            params={"url": url, "hd": 1},
+        )
+        data = resp.json()
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if not os.path.exists(filename):
-                base, _ = os.path.splitext(filename)
-                filename = base + ".mp4"
+        if data.get("code") != 0 or not data.get("data"):
+            raise RuntimeError(data.get("msg", "Не удалось получить видео"))
 
-            return {
-                "path": filename,
-                "title": info.get("title", ""),
-                "author": info.get("uploader", ""),
-                "author_id": info.get("uploader_id", ""),
-                "duration": info.get("duration", 0),
-                "views": info.get("view_count", 0),
-                "likes": info.get("like_count", 0),
-            }
-    except Exception as e:
-        raise RuntimeError(str(e))
+        video = data["data"]
+        video_url = video.get("hdplay") or video.get("play")
+        if not video_url:
+            raise RuntimeError("Нет ссылки на видео")
+
+        if video_url.startswith("//"):
+            video_url = "https:" + video_url
+
+        video_id = video.get("id", "video")
+        filepath = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp4")
+
+        resp = await client.get(video_url)
+        resp.raise_for_status()
+        with open(filepath, "wb") as f:
+            f.write(resp.content)
+
+        return {
+            "path": filepath,
+            "title": video.get("title", ""),
+            "author": video.get("author", {}).get("nickname", ""),
+            "author_id": video.get("author", {}).get("unique_id", ""),
+            "duration": video.get("duration", 0),
+            "views": video.get("play_count", 0),
+            "likes": video.get("digg_count", 0),
+        }
 
 
 def cleanup(path: str):

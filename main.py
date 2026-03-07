@@ -67,7 +67,7 @@ async def handle_message(message: Message):
         status = await message.answer("Скачиваю...")
 
         try:
-            result = await asyncio.to_thread(download_video, url)
+            result = await download_video(url)
         except RuntimeError as e:
             await status.edit_text(f"Ошибка: {e}")
             continue
