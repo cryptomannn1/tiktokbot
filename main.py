@@ -102,10 +102,9 @@ async def handle_message(message: Message):
 
         try:
             video_file = FSInputFile(path)
-            await message.answer_video(
-                video=video_file,
+            await message.answer_document(
+                document=video_file,
                 caption=caption,
-                duration=result.get("duration"),
             )
             await status.delete()
         except Exception as e:
