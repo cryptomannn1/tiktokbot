@@ -64,21 +64,70 @@ async def download_tiktok(url: str) -> dict | None:
         }
 
 
+async def _cobalt_download(url: str, filename: str) -> dict:
+    """Универсальный загрузчик через cobalt.tools API."""
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        resp = await client.post(
+            "https://api.cobalt.tools/",
+            json={"url": url, "videoQuality": "1080"},
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"Cobalt API ошибка ({resp.status_code})")
+
+        try:
+            data = resp.json()
+        except Exception:
+            raise RuntimeError("Cobalt API вернул некорректный ответ")
+
+        status = data.get("status")
+        if status == "error":
+            raise RuntimeError(data.get("text", "Не удалось скачать видео"))
+
+        video_url = data.get("url")
+        if not video_url:
+            raise RuntimeError("Нет ссылки на видео")
+
+        filepath = await _download_file(client, video_url, filename)
+
+        return {
+            "path": filepath,
+            "title": "",
+            "author": "",
+            "author_id": "",
+            "duration": 0,
+            "views": 0,
+            "likes": 0,
+        }
+
+
 async def download_twitter(url: str) -> dict | None:
-    """Скачать Twitter/X видео через fxtwitter API."""
-    # Преобразуем URL в API-запрос fxtwitter
+    """Скачать Twitter/X видео."""
     match = re.search(r"(?:twitter\.com|x\.com)/(\w+)/status/(\d+)", url)
     if not match:
         raise RuntimeError("Некорректная ссылка на Twitter/X")
 
-    user, status_id = match.group(1), match.group(2)
+    status_id = match.group(2)
+
+    # Пробуем cobalt API
+    try:
+        return await _cobalt_download(url, f"tw_{status_id}.mp4")
+    except Exception:
+        pass
+
+    # Фоллбэк: fxtwitter API
+    user = match.group(1)
     api_url = f"https://api.fxtwitter.com/{user}/status/{status_id}"
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         resp = await client.get(api_url)
 
         if resp.status_code != 200:
-            raise RuntimeError(f"Twitter API вернул ошибку ({resp.status_code})")
+            raise RuntimeError(f"Twitter API ошибка ({resp.status_code})")
 
         try:
             data = resp.json()
@@ -112,19 +161,31 @@ async def download_twitter(url: str) -> dict | None:
 
 
 async def download_instagram(url: str) -> dict | None:
-    """Скачать Instagram Reels через API."""
+    """Скачать Instagram Reels."""
+    file_id = uuid.uuid4().hex[:12]
+
+    # Пробуем cobalt API
+    try:
+        return await _cobalt_download(url, f"ig_{file_id}.mp4")
+    except Exception:
+        pass
+
+    # Фоллбэк: saveig API
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         resp = await client.get(
             "https://api.saveig.app/api/v1/media",
             params={"url": url},
         )
-        data = resp.json()
+
+        try:
+            data = resp.json()
+        except Exception:
+            raise RuntimeError("Instagram API вернул некорректный ответ")
 
         if not data.get("data"):
             raise RuntimeError("Не удалось получить видео из Instagram")
 
         items = data["data"]
-        # Ищем первый видео-элемент
         video_item = None
         for item in items:
             if item.get("type") == "video" or item.get("url", "").endswith(".mp4"):
@@ -138,7 +199,6 @@ async def download_instagram(url: str) -> dict | None:
         if not video_url:
             raise RuntimeError("Нет ссылки на видео")
 
-        file_id = uuid.uuid4().hex[:12]
         filepath = await _download_file(client, video_url, f"ig_{file_id}.mp4")
 
         return {
