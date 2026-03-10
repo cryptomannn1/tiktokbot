@@ -140,6 +140,10 @@ async def handle_message(message: Message):
         except RuntimeError as e:
             await status.edit_text(f"Ошибка: {e}")
             continue
+        except Exception as e:
+            log.exception("Неожиданная ошибка загрузки: %s", e)
+            await status.edit_text("Ошибка при скачивании. Попробуй позже.")
+            continue
 
         if not result:
             await status.edit_text("Не удалось скачать видео.")

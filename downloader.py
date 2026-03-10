@@ -76,7 +76,14 @@ async def download_twitter(url: str) -> dict | None:
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         resp = await client.get(api_url)
-        data = resp.json()
+
+        if resp.status_code != 200:
+            raise RuntimeError(f"Twitter API вернул ошибку ({resp.status_code})")
+
+        try:
+            data = resp.json()
+        except Exception:
+            raise RuntimeError("Twitter API вернул некорректный ответ")
 
         tweet = data.get("tweet")
         if not tweet:
