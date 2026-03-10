@@ -14,7 +14,7 @@ log = logging.getLogger(__name__)
 
 DOWNLOAD_TIMEOUT = 120
 COMPRESS_TIMEOUT = 300  # 5 минут на сжатие
-MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024  # 200 MB — максимум для скачивания (потом сожмём)
+MAX_DOWNLOAD_SIZE = 500 * 1024 * 1024  # 500 MB — максимум для скачивания (потом сожмём)
 
 
 def _safe_remove(path: str):
@@ -138,7 +138,7 @@ async def _download_file(client: httpx.AsyncClient, video_url: str, filename: st
                     async for chunk in resp.aiter_bytes(chunk_size=65536):
                         downloaded += len(chunk)
                         if downloaded > MAX_DOWNLOAD_SIZE:
-                            raise RuntimeError("Видео слишком большое (больше 200 МБ)")
+                            raise RuntimeError("Видео слишком большое (больше 500 МБ)")
                         f.write(chunk)
     except TimeoutError:
         _safe_remove(filepath)
@@ -221,7 +221,7 @@ async def _ytdlp_download(url: str, filename: str) -> dict:
     file_size = video_file.stat().st_size
     if file_size > MAX_DOWNLOAD_SIZE:
         _cleanup_partial()
-        raise RuntimeError("Видео слишком большое (больше 200 МБ)")
+        raise RuntimeError("Видео слишком большое (больше 500 МБ)")
 
     # Метаданные
     metadata = {"title": "", "author": "", "author_id": "", "duration": 0, "views": 0, "likes": 0}
