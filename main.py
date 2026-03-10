@@ -13,7 +13,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
 
 from config import BOT_TOKEN, MAX_FILE_SIZE, ADMIN_ID
-from downloader import download_video, cleanup
+from downloader import download_tiktok, download_twitter, download_instagram, cleanup
 from db import track_user, increment_downloads, get_stats, get_all_users
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -24,6 +24,12 @@ dp = Dispatcher()
 
 TIKTOK_RE = re.compile(
     r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+"
+)
+TWITTER_RE = re.compile(
+    r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+\S*"
+)
+INSTAGRAM_RE = re.compile(
+    r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[\w-]+\S*"
 )
 
 
@@ -40,11 +46,11 @@ async def cmd_start(message: Message):
     track_user(message.from_user.id, message.from_user.username,
                message.from_user.first_name, message.from_user.last_name)
     await message.answer(
-        "Привет! Отправь ссылку на TikTok видео, и я скачаю его для тебя.\n\n"
-        "Поддерживаемые форматы ссылок:\n"
-        "- https://www.tiktok.com/@user/video/...\n"
-        "- https://vm.tiktok.com/...\n"
-        "- https://vt.tiktok.com/...\n\n"
+        "Привет! Отправь ссылку на видео, и я скачаю его для тебя.\n\n"
+        "Поддерживаемые платформы:\n"
+        "- TikTok (tiktok.com, vm.tiktok.com)\n"
+        "- Instagram Reels (instagram.com/reel/...)\n"
+        "- Twitter / X (x.com, twitter.com)\n\n"
         "/help - справка"
     )
 
@@ -52,9 +58,13 @@ async def cmd_start(message: Message):
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
-        "Просто отправь ссылку на TikTok видео.\n"
+        "Просто отправь ссылку на видео.\n"
         "Можно отправить несколько ссылок в одном сообщении.\n\n"
-        "Бот скачает видео без водяного знака и отправит его тебе."
+        "Поддерживаемые платформы:\n"
+        "- TikTok — видео без водяного знака\n"
+        "- Instagram Reels\n"
+        "- Twitter / X\n\n"
+        "Бот скачает видео и отправит его тебе."
     )
 
 
@@ -97,17 +107,29 @@ async def handle_message(message: Message):
     track_user(message.from_user.id, message.from_user.username,
                message.from_user.first_name, message.from_user.last_name)
 
-    urls = TIKTOK_RE.findall(message.text)
+    # Собираем все ссылки с указанием платформы
+    links = []
+    for url in TIKTOK_RE.findall(message.text):
+        links.append(("tiktok", url))
+    for url in TWITTER_RE.findall(message.text):
+        links.append(("twitter", url))
+    for url in INSTAGRAM_RE.findall(message.text):
+        links.append(("instagram", url))
 
-    if not urls:
-        await message.answer("Отправь ссылку на TikTok видео.")
+    if not links:
+        await message.answer("Отправь ссылку на видео (TikTok, Instagram Reels или Twitter/X).")
         return
 
-    for url in urls:
+    for platform, url in links:
         status = await message.answer("Скачиваю...")
 
         try:
-            result = await download_video(url)
+            if platform == "tiktok":
+                result = await download_tiktok(url)
+            elif platform == "twitter":
+                result = await download_twitter(url)
+            else:
+                result = await download_instagram(url)
         except RuntimeError as e:
             await status.edit_text(f"Ошибка: {e}")
             continue
