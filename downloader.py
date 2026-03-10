@@ -3,18 +3,30 @@ from __future__ import annotations
 import os
 import re
 import uuid
+import asyncio
 import httpx
-from config import DOWNLOAD_DIR
+from config import DOWNLOAD_DIR, MAX_FILE_SIZE
+
+# Общий таймаут на всю загрузку (секунды)
+DOWNLOAD_TIMEOUT = 60
 
 
 async def _download_file(client: httpx.AsyncClient, video_url: str, filename: str) -> str:
-    """Скачать файл по URL и вернуть путь."""
+    """Скачать файл по URL потоково с общим таймаутом."""
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     filepath = os.path.join(DOWNLOAD_DIR, filename)
-    resp = await client.get(video_url)
-    resp.raise_for_status()
-    with open(filepath, "wb") as f:
-        f.write(resp.content)
+
+    async with asyncio.timeout(DOWNLOAD_TIMEOUT):
+        async with client.stream("GET", video_url) as resp:
+            resp.raise_for_status()
+            downloaded = 0
+            with open(filepath, "wb") as f:
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    downloaded += len(chunk)
+                    if downloaded > MAX_FILE_SIZE:
+                        raise RuntimeError("Видео слишком большое (больше 50 МБ)")
+                    f.write(chunk)
+
     return filepath
 
 
