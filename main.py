@@ -179,6 +179,10 @@ async def handle_message(message: Message):
 
 async def main():
     log.info("Бот запущен")
+    try:
+        await bot.send_message(ADMIN_ID, "Бот перезапущен и обновлён.")
+    except Exception as e:
+        log.warning("Не удалось отправить уведомление админу: %s", e)
     await dp.start_polling(bot)
 
 
