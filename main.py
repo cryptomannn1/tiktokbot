@@ -120,8 +120,15 @@ async def handle_message(message: Message):
         await message.answer("Отправь ссылку на видео (TikTok, Instagram Reels или Twitter/X).")
         return
 
+    platform_names = {
+        "tiktok": "TikTok",
+        "twitter": "Twitter/X",
+        "instagram": "Instagram",
+    }
+
     for platform, url in links:
-        status = await message.answer("Скачиваю...")
+        name = platform_names.get(platform, "")
+        status = await message.answer(f"Скачиваю с {name}...")
 
         try:
             if platform == "tiktok":
