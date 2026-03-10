@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import uuid
 import asyncio
+import logging
 import httpx
+from pathlib import Path
 from config import DOWNLOAD_DIR, MAX_FILE_SIZE
 
-# Общий таймаут на всю загрузку (секунды)
-DOWNLOAD_TIMEOUT = 60
+log = logging.getLogger(__name__)
+
+DOWNLOAD_TIMEOUT = 90
 
 
 async def _download_file(client: httpx.AsyncClient, video_url: str, filename: str) -> str:
@@ -28,6 +32,82 @@ async def _download_file(client: httpx.AsyncClient, video_url: str, filename: st
                     f.write(chunk)
 
     return filepath
+
+
+async def _ytdlp_download(url: str, filename: str) -> dict:
+    """Универсальный загрузчик через yt-dlp (subprocess)."""
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    filepath = os.path.join(DOWNLOAD_DIR, filename)
+    info_path = filepath + ".info.json"
+
+    cmd = [
+        "yt-dlp",
+        "--no-warnings",
+        "--no-playlist",
+        "--max-filesize", "50m",
+        "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "--merge-output-format", "mp4",
+        "--write-info-json",
+        "--no-write-playlist-metafiles",
+        "-o", filepath,
+        url,
+    ]
+
+    log.info("yt-dlp: %s", url)
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=DOWNLOAD_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        raise RuntimeError("Загрузка заняла слишком много времени")
+
+    if process.returncode != 0:
+        error_msg = stderr.decode("utf-8", errors="replace")
+        log.error("yt-dlp ошибка: %s", error_msg[:300])
+        raise RuntimeError("Не удалось скачать видео")
+
+    # Ищем скачанный файл
+    video_file = None
+    for f in Path(DOWNLOAD_DIR).iterdir():
+        if f.name.startswith(Path(filename).stem) and f.suffix in (".mp4", ".webm", ".mkv"):
+            video_file = f
+            break
+
+    if not video_file or not video_file.exists():
+        raise RuntimeError("Видео файл не найден после загрузки")
+
+    file_size = video_file.stat().st_size
+    if file_size > MAX_FILE_SIZE:
+        video_file.unlink(missing_ok=True)
+        raise RuntimeError("Видео слишком большое (больше 50 МБ)")
+
+    # Метаданные
+    metadata = {"title": "", "author": "", "author_id": "", "duration": 0, "views": 0, "likes": 0}
+    info_file = Path(info_path)
+    if info_file.exists():
+        try:
+            data = json.loads(info_file.read_text(encoding="utf-8"))
+            metadata["title"] = data.get("title", "")[:200]
+            metadata["author"] = data.get("uploader", data.get("creator", ""))
+            metadata["author_id"] = data.get("uploader_id", "")
+            metadata["duration"] = data.get("duration", 0)
+            metadata["views"] = data.get("view_count", 0)
+            metadata["likes"] = data.get("like_count", 0)
+        except Exception:
+            pass
+        finally:
+            info_file.unlink(missing_ok=True)
+
+    metadata["path"] = str(video_file)
+    return metadata
 
 
 async def download_tiktok(url: str) -> dict | None:
@@ -64,152 +144,19 @@ async def download_tiktok(url: str) -> dict | None:
         }
 
 
-async def _cobalt_download(url: str, filename: str) -> dict:
-    """Универсальный загрузчик через cobalt.tools API."""
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.post(
-            "https://api.cobalt.tools/",
-            json={"url": url, "videoQuality": "1080"},
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-        )
-
-        if resp.status_code != 200:
-            raise RuntimeError(f"Cobalt API ошибка ({resp.status_code})")
-
-        try:
-            data = resp.json()
-        except Exception:
-            raise RuntimeError("Cobalt API вернул некорректный ответ")
-
-        status = data.get("status")
-        if status == "error":
-            raise RuntimeError(data.get("text", "Не удалось скачать видео"))
-
-        video_url = data.get("url")
-        if not video_url:
-            raise RuntimeError("Нет ссылки на видео")
-
-        filepath = await _download_file(client, video_url, filename)
-
-        return {
-            "path": filepath,
-            "title": "",
-            "author": "",
-            "author_id": "",
-            "duration": 0,
-            "views": 0,
-            "likes": 0,
-        }
-
-
 async def download_twitter(url: str) -> dict | None:
-    """Скачать Twitter/X видео."""
+    """Скачать Twitter/X видео через yt-dlp."""
     match = re.search(r"(?:twitter\.com|x\.com)/(\w+)/status/(\d+)", url)
     if not match:
         raise RuntimeError("Некорректная ссылка на Twitter/X")
-
     status_id = match.group(2)
-
-    # Пробуем cobalt API
-    try:
-        return await _cobalt_download(url, f"tw_{status_id}.mp4")
-    except Exception:
-        pass
-
-    # Фоллбэк: fxtwitter API
-    user = match.group(1)
-    api_url = f"https://api.fxtwitter.com/{user}/status/{status_id}"
-
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(api_url)
-
-        if resp.status_code != 200:
-            raise RuntimeError(f"Twitter API ошибка ({resp.status_code})")
-
-        try:
-            data = resp.json()
-        except Exception:
-            raise RuntimeError("Twitter API вернул некорректный ответ")
-
-        tweet = data.get("tweet")
-        if not tweet:
-            raise RuntimeError("Не удалось получить твит")
-
-        media = tweet.get("media")
-        if not media or not media.get("videos"):
-            raise RuntimeError("В этом твите нет видео")
-
-        best_video = media["videos"][0]
-        video_url = best_video.get("url")
-        if not video_url:
-            raise RuntimeError("Нет ссылки на видео")
-
-        filepath = await _download_file(client, video_url, f"tw_{status_id}.mp4")
-
-        return {
-            "path": filepath,
-            "title": tweet.get("text", "")[:200],
-            "author": tweet.get("author", {}).get("name", ""),
-            "author_id": tweet.get("author", {}).get("screen_name", ""),
-            "duration": best_video.get("duration", 0),
-            "views": tweet.get("views", 0),
-            "likes": tweet.get("likes", 0),
-        }
+    return await _ytdlp_download(url, f"tw_{status_id}.mp4")
 
 
 async def download_instagram(url: str) -> dict | None:
-    """Скачать Instagram Reels."""
+    """Скачать Instagram Reels через yt-dlp."""
     file_id = uuid.uuid4().hex[:12]
-
-    # Пробуем cobalt API
-    try:
-        return await _cobalt_download(url, f"ig_{file_id}.mp4")
-    except Exception:
-        pass
-
-    # Фоллбэк: saveig API
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(
-            "https://api.saveig.app/api/v1/media",
-            params={"url": url},
-        )
-
-        try:
-            data = resp.json()
-        except Exception:
-            raise RuntimeError("Instagram API вернул некорректный ответ")
-
-        if not data.get("data"):
-            raise RuntimeError("Не удалось получить видео из Instagram")
-
-        items = data["data"]
-        video_item = None
-        for item in items:
-            if item.get("type") == "video" or item.get("url", "").endswith(".mp4"):
-                video_item = item
-                break
-
-        if not video_item:
-            raise RuntimeError("Видео не найдено в этом посте")
-
-        video_url = video_item.get("url")
-        if not video_url:
-            raise RuntimeError("Нет ссылки на видео")
-
-        filepath = await _download_file(client, video_url, f"ig_{file_id}.mp4")
-
-        return {
-            "path": filepath,
-            "title": "",
-            "author": "",
-            "author_id": "",
-            "duration": 0,
-            "views": 0,
-            "likes": 0,
-        }
+    return await _ytdlp_download(url, f"ig_{file_id}.mp4")
 
 
 def cleanup(path: str):
