@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Telegram-бот для скачивания TikTok видео."""
+"""Telegram-бот для скачивания видео из TikTok, Instagram и Twitter."""
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +13,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
 
 from config import BOT_TOKEN, MAX_FILE_SIZE, ADMIN_ID
-from downloader import download_tiktok, download_twitter, download_instagram, cleanup
+from downloader import download_tiktok, download_twitter, download_instagram, compress_video, cleanup
 from db import track_user, increment_downloads, get_stats, get_all_users
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -22,15 +22,18 @@ log = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Regex паттерны — без захвата замыкающей пунктуации
 TIKTOK_RE = re.compile(
-    r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/\S+"
+    r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s,;!?)>\]\"']+"
 )
 TWITTER_RE = re.compile(
-    r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+\S*"
+    r"https?://(?:www\.)?(?:twitter\.com|x\.com)/\w+/status/\d+[^\s,;!?)>\]\"']*"
 )
 INSTAGRAM_RE = re.compile(
-    r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[\w-]+\S*"
+    r"https?://(?:www\.)?instagram\.com/(?:reel|reels|p)/[\w-]+[^\s,;!?)>\]\"']*"
 )
+
+TELEGRAM_CAPTION_LIMIT = 1024
 
 
 def format_number(n: int) -> str:
@@ -64,6 +67,7 @@ async def cmd_help(message: Message):
         "- TikTok — видео без водяного знака\n"
         "- Instagram Reels\n"
         "- Twitter / X\n\n"
+        "Если видео больше 50 МБ — бот автоматически сожмёт его.\n"
         "Бот скачает видео и отправит его тебе."
     )
 
@@ -128,7 +132,7 @@ async def handle_message(message: Message):
 
     for platform, url in links:
         name = platform_names.get(platform, "")
-        status = await message.answer(f"Скачиваю с {name}...")
+        status = await message.answer(f"⏳ Скачиваю с {name}...")
 
         try:
             if platform == "tiktok":
@@ -138,52 +142,83 @@ async def handle_message(message: Message):
             else:
                 result = await download_instagram(url)
         except RuntimeError as e:
-            await status.edit_text(f"Ошибка: {e}")
+            await status.edit_text(f"❌ Ошибка: {e}")
             continue
         except Exception as e:
             log.exception("Неожиданная ошибка загрузки: %s", e)
-            await status.edit_text("Ошибка при скачивании. Попробуй позже.")
+            await status.edit_text("❌ Ошибка при скачивании. Попробуй позже.")
             continue
 
         if not result:
-            await status.edit_text("Не удалось скачать видео.")
+            await status.edit_text("❌ Не удалось скачать видео.")
             continue
 
         path = result["path"]
-        file_size = os.path.getsize(path)
 
-        if file_size > MAX_FILE_SIZE:
-            await status.edit_text("Видео слишком большое (больше 50 МБ).")
-            cleanup(path)
+        # Автоматическое сжатие, если файл больше лимита Telegram (50 МБ)
+        try:
+            file_size = os.path.getsize(path)
+            if file_size > MAX_FILE_SIZE:
+                size_mb = file_size / (1024 * 1024)
+                await status.edit_text(f"🗜 Видео {size_mb:.0f} МБ — сжимаю...")
+                path = await compress_video(path)
+                result["path"] = path
+        except RuntimeError as e:
+            await status.edit_text(f"❌ Ошибка: {e}")
+            cleanup(result["path"])
+            continue
+        except Exception as e:
+            log.exception("Ошибка сжатия: %s", e)
+            await status.edit_text("❌ Не удалось сжать видео.")
+            cleanup(result["path"])
             continue
 
+        # Формируем подпись
         caption_parts = []
-        if result["author"]:
-            caption_parts.append(f"{result['author']} (@{result['author_id']})")
-        if result["title"]:
+        if result.get("author"):
+            author_line = result["author"]
+            if result.get("author_id"):
+                author_line += f" (@{result['author_id']})"
+            caption_parts.append(author_line)
+        if result.get("title"):
             caption_parts.append(result["title"][:200])
 
-        stats = []
-        if result["views"]:
-            stats.append(f"Просмотры: {format_number(result['views'])}")
-        if result["likes"]:
-            stats.append(f"Лайки: {format_number(result['likes'])}")
-        if stats:
-            caption_parts.append(" | ".join(stats))
+        stats_parts = []
+        if result.get("views"):
+            stats_parts.append(f"👁 {format_number(result['views'])}")
+        if result.get("likes"):
+            stats_parts.append(f"❤️ {format_number(result['likes'])}")
+        if stats_parts:
+            caption_parts.append(" | ".join(stats_parts))
 
         caption = "\n".join(caption_parts) if caption_parts else None
 
+        # Обрезаем подпись до лимита Telegram (1024 символа)
+        if caption and len(caption) > TELEGRAM_CAPTION_LIMIT:
+            caption = caption[:TELEGRAM_CAPTION_LIMIT - 3] + "..."
+
         try:
             video_file = FSInputFile(path)
-            await message.answer_document(
-                document=video_file,
+            await message.answer_video(
+                video=video_file,
                 caption=caption,
             )
             await status.delete()
             increment_downloads(message.from_user.id)
         except Exception as e:
             log.error("Ошибка отправки: %s", e)
-            await status.edit_text("Не удалось отправить видео.")
+            # Fallback: попробуем как документ
+            try:
+                video_file = FSInputFile(path)
+                await message.answer_document(
+                    document=video_file,
+                    caption=caption,
+                )
+                await status.delete()
+                increment_downloads(message.from_user.id)
+            except Exception as e2:
+                log.error("Ошибка отправки документом: %s", e2)
+                await status.edit_text("❌ Не удалось отправить видео.")
         finally:
             cleanup(path)
 
@@ -193,12 +228,11 @@ async def main():
     try:
         await bot.send_message(
             ADMIN_ID,
-            "✅ Бот обновлён и перезапущен!\n\n"
+            "✅ Бот перезапущен!\n\n"
             "Что нового:\n"
-            "• Добавлена загрузка Instagram Reels\n"
-            "• Добавлена загрузка видео из Twitter/X\n"
-            "• Статус загрузки теперь показывает платформу\n"
-            "• Улучшена стабильность загрузки (таймаут 60 сек)"
+            "• Автоматическое сжатие видео > 50 МБ\n"
+            "• Улучшена стабильность загрузки\n"
+            "• Исправлены ошибки"
         )
     except Exception as e:
         log.warning("Не удалось отправить уведомление админу: %s", e)

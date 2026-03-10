@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+venv/
+__pycache__/
+*.pyc
+*.pyo
+downloads/
+bot.db
+*.md
+.claude/
+start.sh
