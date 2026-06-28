@@ -8,7 +8,7 @@ import os
 import re
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, FSInputFile, InputMediaPhoto
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
 
@@ -44,6 +44,75 @@ def format_number(n: int) -> str:
     return str(n)
 
 
+def build_caption(result: dict) -> str | None:
+    """Сформировать подпись из метаданных (автор, заголовок, статистика)."""
+    caption_parts = []
+    if result.get("author"):
+        author_line = result["author"]
+        if result.get("author_id"):
+            author_line += f" (@{result['author_id']})"
+        caption_parts.append(author_line)
+    if result.get("title"):
+        caption_parts.append(result["title"][:200])
+
+    stats_parts = []
+    if result.get("views"):
+        stats_parts.append(f"👁 {format_number(result['views'])}")
+    if result.get("likes"):
+        stats_parts.append(f"❤️ {format_number(result['likes'])}")
+    if stats_parts:
+        caption_parts.append(" | ".join(stats_parts))
+
+    caption = "\n".join(caption_parts) if caption_parts else None
+    if caption and len(caption) > TELEGRAM_CAPTION_LIMIT:
+        caption = caption[:TELEGRAM_CAPTION_LIMIT - 3] + "..."
+    return caption
+
+
+async def send_photo_post(message: Message, status: Message, result: dict) -> bool:
+    """Отправить фото-пост (slideshow): альбом картинок + аудиодорожка.
+
+    Возвращает True при успешной отправке.
+    """
+    images = result.get("images", [])
+    music = result.get("music")
+    caption = build_caption(result)
+
+    try:
+        # Telegram: в одном альбоме максимум 10 элементов
+        for i in range(0, len(images), 10):
+            chunk = images[i:i + 10]
+            chunk_caption = caption if i == 0 else None
+            if len(chunk) == 1:
+                await message.answer_photo(
+                    photo=FSInputFile(chunk[0]), caption=chunk_caption
+                )
+            else:
+                media = [
+                    InputMediaPhoto(
+                        media=FSInputFile(img),
+                        caption=chunk_caption if j == 0 else None,
+                    )
+                    for j, img in enumerate(chunk)
+                ]
+                await message.answer_media_group(media=media)
+
+        if music:
+            await message.answer_audio(audio=FSInputFile(music))
+
+        await status.delete()
+        return True
+    except Exception as e:
+        log.error("Ошибка отправки фото-поста: %s", e)
+        await status.edit_text("❌ Не удалось отправить фото.")
+        return False
+    finally:
+        for img in images:
+            cleanup(img)
+        if music:
+            cleanup(music)
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     track_user(message.from_user.id, message.from_user.username,
@@ -64,7 +133,7 @@ async def cmd_help(message: Message):
         "Просто отправь ссылку на видео.\n"
         "Можно отправить несколько ссылок в одном сообщении.\n\n"
         "Поддерживаемые платформы:\n"
-        "- TikTok — видео без водяного знака\n"
+        "- TikTok — видео без водяного знака, а также фото-посты (слайдшоу) + музыка\n"
         "- Instagram Reels\n"
         "- Twitter / X\n\n"
         "Если видео больше 50 МБ — бот автоматически сожмёт его.\n"
@@ -153,6 +222,12 @@ async def handle_message(message: Message):
             await status.edit_text("❌ Не удалось скачать видео.")
             continue
 
+        # Фото-пост (картинки + музыка) — отправляем альбомом, не как видео
+        if result.get("type") == "images":
+            if await send_photo_post(message, status, result):
+                increment_downloads(message.from_user.id)
+            continue
+
         path = result["path"]
 
         # Автоматическое сжатие, если файл больше лимита Telegram (50 МБ)
@@ -173,29 +248,7 @@ async def handle_message(message: Message):
             cleanup(result["path"])
             continue
 
-        # Формируем подпись
-        caption_parts = []
-        if result.get("author"):
-            author_line = result["author"]
-            if result.get("author_id"):
-                author_line += f" (@{result['author_id']})"
-            caption_parts.append(author_line)
-        if result.get("title"):
-            caption_parts.append(result["title"][:200])
-
-        stats_parts = []
-        if result.get("views"):
-            stats_parts.append(f"👁 {format_number(result['views'])}")
-        if result.get("likes"):
-            stats_parts.append(f"❤️ {format_number(result['likes'])}")
-        if stats_parts:
-            caption_parts.append(" | ".join(stats_parts))
-
-        caption = "\n".join(caption_parts) if caption_parts else None
-
-        # Обрезаем подпись до лимита Telegram (1024 символа)
-        if caption and len(caption) > TELEGRAM_CAPTION_LIMIT:
-            caption = caption[:TELEGRAM_CAPTION_LIMIT - 3] + "..."
+        caption = build_caption(result)
 
         try:
             video_file = FSInputFile(path)
@@ -230,6 +283,7 @@ async def main():
             ADMIN_ID,
             "✅ Бот перезапущен!\n\n"
             "Что нового:\n"
+            "• Поддержка TikTok фото-постов (слайдшоу): альбом картинок + музыка\n"
             "• Автоматическое сжатие видео > 50 МБ\n"
             "• Улучшена стабильность загрузки\n"
             "• Исправлены ошибки"

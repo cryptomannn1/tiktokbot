@@ -249,8 +249,15 @@ async def _ytdlp_download(url: str, filename: str) -> dict:
     return metadata
 
 
+def _normalize_url(url: str) -> str:
+    """Привести protocol-relative URL (//...) к https."""
+    if url.startswith("//"):
+        return "https:" + url
+    return url
+
+
 async def download_tiktok(url: str) -> dict | None:
-    """Скачать TikTok видео через tikwm API."""
+    """Скачать TikTok видео или фото-пост (slideshow) через tikwm API."""
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         resp = await client.get(
             "https://www.tikwm.com/api/",
@@ -262,24 +269,57 @@ async def download_tiktok(url: str) -> dict | None:
             raise RuntimeError(data.get("msg", "Не удалось получить видео"))
 
         video = data["data"]
+        base_id = video.get("id", uuid.uuid4().hex[:12])
+
+        meta = {
+            "title": video.get("title", ""),
+            "author": video.get("author", {}).get("nickname", ""),
+            "author_id": video.get("author", {}).get("unique_id", ""),
+            "views": video.get("play_count", 0),
+            "likes": video.get("digg_count", 0),
+        }
+
+        # Фото-пост (картинки + музыка) — не видео, обрабатываем отдельно
+        images = video.get("images")
+        if images:
+            image_paths = []
+            for idx, img_url in enumerate(images):
+                try:
+                    p = await _download_file(
+                        client, _normalize_url(img_url), f"tt_{base_id}_{idx}.jpg"
+                    )
+                    image_paths.append(p)
+                except Exception as e:
+                    log.warning("Не удалось скачать изображение %d: %s", idx, e)
+
+            if not image_paths:
+                raise RuntimeError("Не удалось скачать изображения")
+
+            music_path = None
+            music_url = video.get("music") or video.get("music_info", {}).get("play")
+            if music_url:
+                try:
+                    music_path = await _download_file(
+                        client, _normalize_url(music_url), f"tt_{base_id}_music.mp3"
+                    )
+                except Exception as e:
+                    log.warning("Не удалось скачать музыку: %s", e)
+
+            return {"type": "images", "images": image_paths, "music": music_path, **meta}
+
         video_url = video.get("hdplay") or video.get("play")
         if not video_url:
             raise RuntimeError("Нет ссылки на видео")
 
-        if video_url.startswith("//"):
-            video_url = "https:" + video_url
-
-        video_id = video.get("id", uuid.uuid4().hex[:12])
-        filepath = await _download_file(client, video_url, f"tt_{video_id}.mp4")
+        filepath = await _download_file(
+            client, _normalize_url(video_url), f"tt_{base_id}.mp4"
+        )
 
         return {
+            "type": "video",
             "path": filepath,
-            "title": video.get("title", ""),
-            "author": video.get("author", {}).get("nickname", ""),
-            "author_id": video.get("author", {}).get("unique_id", ""),
             "duration": video.get("duration", 0),
-            "views": video.get("play_count", 0),
-            "likes": video.get("digg_count", 0),
+            **meta,
         }
 
 
