@@ -115,8 +115,8 @@ async def send_photo_post(message: Message, status: Message, result: dict) -> bo
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    track_user(message.from_user.id, message.from_user.username,
-               message.from_user.first_name, message.from_user.last_name)
+    await track_user(message.from_user.id, message.from_user.username,
+                     message.from_user.first_name, message.from_user.last_name)
     await message.answer(
         "Привет! Отправь ссылку на видео, и я скачаю его для тебя.\n\n"
         "Поддерживаемые платформы:\n"
@@ -136,7 +136,7 @@ async def cmd_help(message: Message):
         "- TikTok — видео без водяного знака, а также фото-посты (слайдшоу) + музыка\n"
         "- Instagram Reels\n"
         "- Twitter / X\n\n"
-        "Если видео больше 50 МБ — бот автоматически сожмёт его.\n"
+        f"Если видео больше {MAX_FILE_SIZE // (1024 * 1024)} МБ — бот автоматически сожмёт его.\n"
         "Бот скачает видео и отправит его тебе."
     )
 
@@ -145,7 +145,7 @@ async def cmd_help(message: Message):
 async def cmd_stats(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    s = get_stats()
+    s = await get_stats()
     await message.answer(
         f"Пользователей: {s['total_users']}\n"
         f"Загрузок: {s['total_downloads']}"
@@ -156,7 +156,7 @@ async def cmd_stats(message: Message):
 async def cmd_users(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
-    users = get_all_users()
+    users = await get_all_users()
     if not users:
         await message.answer("Пользователей пока нет.")
         return
@@ -177,8 +177,8 @@ async def cmd_users(message: Message):
 
 @dp.message(F.text)
 async def handle_message(message: Message):
-    track_user(message.from_user.id, message.from_user.username,
-               message.from_user.first_name, message.from_user.last_name)
+    await track_user(message.from_user.id, message.from_user.username,
+                     message.from_user.first_name, message.from_user.last_name)
 
     # Собираем все ссылки с указанием платформы
     links = []
@@ -225,7 +225,7 @@ async def handle_message(message: Message):
         # Фото-пост (картинки + музыка) — отправляем альбомом, не как видео
         if result.get("type") == "images":
             if await send_photo_post(message, status, result):
-                increment_downloads(message.from_user.id)
+                await increment_downloads(message.from_user.id)
             continue
 
         path = result["path"]
@@ -257,7 +257,7 @@ async def handle_message(message: Message):
                 caption=caption,
             )
             await status.delete()
-            increment_downloads(message.from_user.id)
+            await increment_downloads(message.from_user.id)
         except Exception as e:
             log.error("Ошибка отправки: %s", e)
             # Fallback: попробуем как документ
@@ -268,7 +268,7 @@ async def handle_message(message: Message):
                     caption=caption,
                 )
                 await status.delete()
-                increment_downloads(message.from_user.id)
+                await increment_downloads(message.from_user.id)
             except Exception as e2:
                 log.error("Ошибка отправки документом: %s", e2)
                 await status.edit_text("❌ Не удалось отправить видео.")
@@ -284,7 +284,7 @@ async def main():
             "✅ Бот перезапущен!\n\n"
             "Что нового:\n"
             "• Поддержка TikTok фото-постов (слайдшоу): альбом картинок + музыка\n"
-            "• Автоматическое сжатие видео > 50 МБ\n"
+            f"• Автоматическое сжатие видео > {MAX_FILE_SIZE // (1024 * 1024)} МБ\n"
             "• Улучшена стабильность загрузки\n"
             "• Исправлены ошибки"
         )

@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 DOWNLOAD_TIMEOUT = 120
 COMPRESS_TIMEOUT = 300  # 5 минут на сжатие
 MAX_DOWNLOAD_SIZE = 500 * 1024 * 1024  # 500 MB — максимум для скачивания (потом сожмём)
+MIN_VIDEO_BITRATE = 200_000  # ниже этого сжатие не имеет смысла — качество слишком плохое
 
 
 def _safe_remove(path: str):
@@ -67,11 +68,12 @@ async def compress_video(filepath: str, target_size: int = MAX_FILE_SIZE) -> str
     # 90% от лимита — оставляем запас
     audio_bitrate = 128_000  # 128 kbps для аудио
     target_total_bitrate = int((target_size * 8 * 0.90) / duration)
-    video_bitrate = max(target_total_bitrate - audio_bitrate, 200_000)
+    video_bitrate = target_total_bitrate - audio_bitrate
 
-    # Если битрейт слишком низкий — качество будет ужасным
-    if video_bitrate < 200_000:
-        raise RuntimeError("Видео слишком длинное для сжатия до 50 МБ")
+    # Если расчётный битрейт слишком низкий — качество будет ужасным, отказываемся
+    if video_bitrate < MIN_VIDEO_BITRATE:
+        target_mb = target_size // (1024 * 1024)
+        raise RuntimeError(f"Видео слишком длинное для сжатия до {target_mb} МБ")
 
     output = filepath.rsplit(".", 1)[0] + "_compressed.mp4"
 
@@ -138,7 +140,7 @@ async def _download_file(client: httpx.AsyncClient, video_url: str, filename: st
                     async for chunk in resp.aiter_bytes(chunk_size=65536):
                         downloaded += len(chunk)
                         if downloaded > MAX_DOWNLOAD_SIZE:
-                            raise RuntimeError("Видео слишком большое (больше 500 МБ)")
+                            raise RuntimeError(f"Видео слишком большое (больше {MAX_DOWNLOAD_SIZE // (1024 * 1024)} МБ)")
                         f.write(chunk)
     except TimeoutError:
         _safe_remove(filepath)
@@ -221,7 +223,7 @@ async def _ytdlp_download(url: str, filename: str) -> dict:
     file_size = video_file.stat().st_size
     if file_size > MAX_DOWNLOAD_SIZE:
         _cleanup_partial()
-        raise RuntimeError("Видео слишком большое (больше 500 МБ)")
+        raise RuntimeError(f"Видео слишком большое (больше {MAX_DOWNLOAD_SIZE // (1024 * 1024)} МБ)")
 
     # Метаданные
     metadata = {"title": "", "author": "", "author_id": "", "duration": 0, "views": 0, "likes": 0}
