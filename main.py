@@ -46,6 +46,16 @@ INSTAGRAM_RE = re.compile(
 )
 
 TELEGRAM_CAPTION_LIMIT = 1024
+MAX_LINKS_PER_MESSAGE = 5
+
+# Один пользователь — одна активная загрузка; остальные его запросы ждут в очереди
+_user_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_user_lock(user_id: int) -> asyncio.Lock:
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    return _user_locks[user_id]
 
 
 def format_number(n: int) -> str:
@@ -136,12 +146,23 @@ async def handle_message(message: Message):
         await message.answer("Отправь ссылку на видео (TikTok, Instagram Reels или Twitter/X).")
         return
 
+    if len(links) > MAX_LINKS_PER_MESSAGE:
+        await message.answer(
+            f"Слишком много ссылок, обработаю первые {MAX_LINKS_PER_MESSAGE}."
+        )
+        links = links[:MAX_LINKS_PER_MESSAGE]
+
     platform_names = {
         "tiktok": "TikTok",
         "twitter": "Twitter/X",
         "instagram": "Instagram",
     }
 
+    async with _get_user_lock(message.from_user.id):
+        await _process_links(message, links, platform_names)
+
+
+async def _process_links(message: Message, links: list, platform_names: dict):
     for platform, url in links:
         name = platform_names.get(platform, "")
         status = await message.answer(f"⏳ Скачиваю с {name}...")

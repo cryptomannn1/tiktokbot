@@ -4,7 +4,8 @@ import sqlite3
 import os
 from datetime import datetime, timezone
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "bot.db")
+# DB_PATH указывает на примонтированный volume — иначе база стирается при каждом деплое
+DB_PATH = os.environ.get("DB_PATH", "").strip() or os.path.join(os.path.dirname(__file__), "bot.db")
 
 _db_initialized = False
 

@@ -39,6 +39,9 @@ DOWNLOAD_TIMEOUT = 120
 COMPRESS_TIMEOUT = 300  # 5 минут на сжатие
 MAX_DOWNLOAD_SIZE = 500 * 1024 * 1024  # 500 MB — максимум для скачивания (потом сожмём)
 
+# Не больше двух ffmpeg одновременно — иначе контейнер упирается в CPU/память
+_FFMPEG_SEM = asyncio.Semaphore(2)
+
 
 def _safe_remove(path: str):
     """Безопасно удалить файл."""
@@ -124,20 +127,21 @@ async def ensure_telegram_compatible(filepath: str) -> str:
 
     log.info("Перекодирую в H.264: %s (codec=%s pix_fmt=%s)", filepath, codec, pix_fmt)
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        _, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=COMPRESS_TIMEOUT
+    async with _FFMPEG_SEM:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except asyncio.TimeoutError:
-        process.kill()
-        _safe_remove(output)
-        log.warning("Перекодирование превысило таймаут — отдаю оригинал")
-        return filepath
+        try:
+            _, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=COMPRESS_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            _safe_remove(output)
+            log.warning("Перекодирование превысило таймаут — отдаю оригинал")
+            return filepath
 
     if process.returncode != 0 or not os.path.exists(output):
         log.error(
@@ -194,20 +198,21 @@ async def compress_video(filepath: str, target_size: int = MAX_FILE_SIZE) -> str
     log.info("Сжимаю видео: %s (%.1f МБ → цель %.1f МБ, битрейт %d kbps)",
              filepath, file_size / (1024 * 1024), target_size / (1024 * 1024), video_bitrate // 1000)
 
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    try:
-        _, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=COMPRESS_TIMEOUT
+    async with _FFMPEG_SEM:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-    except asyncio.TimeoutError:
-        process.kill()
-        _safe_remove(output)
-        raise RuntimeError("Сжатие видео заняло слишком много времени")
+
+        try:
+            _, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=COMPRESS_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            process.kill()
+            _safe_remove(output)
+            raise RuntimeError("Сжатие видео заняло слишком много времени")
 
     if process.returncode != 0:
         log.error("ffmpeg ошибка: %s", stderr.decode("utf-8", errors="replace")[:500])
@@ -401,8 +406,11 @@ async def _tiktok_via_tikwm(url: str) -> dict | None:
         if video_url.startswith("//"):
             video_url = "https:" + video_url
 
-        video_id = video.get("id", uuid.uuid4().hex[:12])
-        filepath = await _download_file(client, video_url, f"tt_{video_id}.mp4")
+        # UUID-префикс: два юзера с одним видео не должны перезаписать файл друг друга
+        video_id = video.get("id", "")
+        filepath = await _download_file(
+            client, video_url, f"tt_{uuid.uuid4().hex[:8]}_{video_id}.mp4"
+        )
 
         return {
             "path": filepath,

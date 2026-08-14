@@ -11,4 +11,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["python3", "main.py"]
+# yt-dlp обновляется на старте: платформы регулярно ломают старые версии
+CMD ["sh", "-c", "pip install --no-cache-dir -q -U yt-dlp; python3 main.py"]
