@@ -353,13 +353,39 @@ async def _ytdlp_download(url: str, filename: str) -> dict:
     return metadata
 
 
+_TIKWM_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.tikwm.com/",
+}
+
+
 async def download_tiktok(url: str) -> dict | None:
-    """Скачать TikTok видео через tikwm API."""
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+    """Скачать TikTok видео через tikwm API, при недоступности — через yt-dlp."""
+    try:
+        return await _tiktok_via_tikwm(url)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        # tikwm блокирует IP датацентров (403 + HTML вместо JSON) — фолбэк на yt-dlp
+        log.warning("tikwm недоступен (%s: %s), пробую yt-dlp", type(e).__name__, e)
+        file_id = uuid.uuid4().hex[:12]
+        return await _ytdlp_download(url, f"tt_{file_id}.mp4")
+
+
+async def _tiktok_via_tikwm(url: str) -> dict | None:
+    async with httpx.AsyncClient(
+        timeout=30, follow_redirects=True, headers=_TIKWM_HEADERS
+    ) as client:
         resp = await client.get(
             "https://www.tikwm.com/api/",
             params={"url": url},
         )
+        if resp.status_code != 200:
+            raise ConnectionError(f"tikwm HTTP {resp.status_code}")
         data = resp.json()
 
         if data.get("code") != 0 or not data.get("data"):
