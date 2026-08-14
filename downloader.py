@@ -4,6 +4,7 @@ import os
 import re
 import json
 import uuid
+import shutil
 import asyncio
 import logging
 import httpx
@@ -11,6 +12,28 @@ from pathlib import Path
 from config import DOWNLOAD_DIR, MAX_FILE_SIZE
 
 log = logging.getLogger(__name__)
+
+
+def _resolve_binary(name: str) -> str:
+    """Найти бинарник в PATH или в типичных местах на macOS/Linux."""
+    found = shutil.which(name)
+    if found:
+        return found
+    candidates = [
+        os.path.expanduser(f"~/bin/{name}"),
+        f"/opt/homebrew/bin/{name}",
+        f"/usr/local/bin/{name}",
+        f"/usr/bin/{name}",
+    ]
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return name  # fallback — subprocess кинет ошибку с понятным сообщением
+
+
+FFMPEG = _resolve_binary("ffmpeg")
+FFPROBE = _resolve_binary("ffprobe")
+YTDLP = _resolve_binary("yt-dlp")
 
 DOWNLOAD_TIMEOUT = 120
 COMPRESS_TIMEOUT = 300  # 5 минут на сжатие
@@ -26,12 +49,13 @@ def _safe_remove(path: str):
         pass
 
 
-async def _get_video_duration(filepath: str) -> float:
-    """Получить длительность видео через ffprobe."""
+async def _ffprobe(filepath: str) -> dict:
+    """Получить метаданные видео через ffprobe (формат + первый видеопоток)."""
     cmd = [
-        "ffprobe", "-v", "quiet",
+        FFPROBE, "-v", "quiet",
         "-print_format", "json",
         "-show_format",
+        "-show_streams",
         filepath,
     ]
     process = await asyncio.create_subprocess_exec(
@@ -41,12 +65,92 @@ async def _get_video_duration(filepath: str) -> float:
     )
     stdout, _ = await process.communicate()
     if process.returncode != 0:
-        return 0.0
+        return {}
     try:
-        data = json.loads(stdout.decode())
-        return float(data.get("format", {}).get("duration", 0))
+        return json.loads(stdout.decode())
     except (json.JSONDecodeError, ValueError):
+        return {}
+
+
+async def _get_video_duration(filepath: str) -> float:
+    """Получить длительность видео через ffprobe."""
+    data = await _ffprobe(filepath)
+    try:
+        return float(data.get("format", {}).get("duration", 0))
+    except (TypeError, ValueError):
         return 0.0
+
+
+# Кодеки и pix_fmt, которые плеер Telegram рендерит с артефактами.
+_TELEGRAM_SAFE_CODECS = {"h264", "avc1"}
+_TELEGRAM_SAFE_PIX_FMTS = {"yuv420p", "yuvj420p"}
+
+
+async def ensure_telegram_compatible(filepath: str) -> str:
+    """Если видео в HEVC/VP9/10-bit — перекодировать в H.264 yuv420p.
+
+    Без этого Telegram на некоторых клиентах показывает полосатые артефакты.
+    """
+    data = await _ffprobe(filepath)
+    video_stream = next(
+        (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
+        None,
+    )
+    if not video_stream:
+        return filepath
+
+    codec = (video_stream.get("codec_name") or "").lower()
+    pix_fmt = (video_stream.get("pix_fmt") or "").lower()
+
+    if codec in _TELEGRAM_SAFE_CODECS and pix_fmt in _TELEGRAM_SAFE_PIX_FMTS:
+        return filepath
+
+    if not codec or not pix_fmt:
+        file_size = os.path.getsize(filepath) if os.path.exists(filepath) else -1
+        log.warning(
+            "ffprobe: пустые поля кодека. stream=%s size=%d",
+            video_stream, file_size,
+        )
+
+    output = filepath.rsplit(".", 1)[0] + "_h264.mp4"
+    cmd = [
+        FFMPEG, "-y", "-i", filepath,
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart",
+        output,
+    ]
+
+    log.info("Перекодирую в H.264: %s (codec=%s pix_fmt=%s)", filepath, codec, pix_fmt)
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=COMPRESS_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        process.kill()
+        _safe_remove(output)
+        log.warning("Перекодирование превысило таймаут — отдаю оригинал")
+        return filepath
+
+    if process.returncode != 0 or not os.path.exists(output):
+        log.error(
+            "ffmpeg ошибка перекодирования (rc=%s): %s",
+            process.returncode,
+            stderr.decode("utf-8", errors="replace")[-3000:],
+        )
+        _safe_remove(output)
+        # Лучше отдать оригинал (возможно с артефактами), чем вернуть ошибку.
+        return filepath
+
+    _safe_remove(filepath)
+    return output
 
 
 async def compress_video(filepath: str, target_size: int = MAX_FILE_SIZE) -> str:
@@ -76,7 +180,7 @@ async def compress_video(filepath: str, target_size: int = MAX_FILE_SIZE) -> str
     output = filepath.rsplit(".", 1)[0] + "_compressed.mp4"
 
     cmd = [
-        "ffmpeg", "-y", "-i", filepath,
+        FFMPEG, "-y", "-i", filepath,
         "-c:v", "libx264", "-preset", "fast",
         "-b:v", str(video_bitrate),
         "-maxrate", str(int(video_bitrate * 1.5)),
@@ -164,7 +268,7 @@ async def _ytdlp_download(url: str, filename: str) -> dict:
     info_path = filepath + ".info.json"
 
     cmd = [
-        "yt-dlp",
+        YTDLP,
         "--no-warnings",
         "--no-playlist",
         "-f", "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
@@ -254,7 +358,7 @@ async def download_tiktok(url: str) -> dict | None:
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         resp = await client.get(
             "https://www.tikwm.com/api/",
-            params={"url": url, "hd": 1},
+            params={"url": url},
         )
         data = resp.json()
 
@@ -262,7 +366,9 @@ async def download_tiktok(url: str) -> dict | None:
             raise RuntimeError(data.get("msg", "Не удалось получить видео"))
 
         video = data["data"]
-        video_url = video.get("hdplay") or video.get("play")
+        # hdplay с tikwm часто отдаёт ByteVC2 (bvc2) — TikTok-проприетарный кодек,
+        # который не декодирует ни ffmpeg, ни Telegram. play = обычный H.264.
+        video_url = video.get("play") or video.get("hdplay")
         if not video_url:
             raise RuntimeError("Нет ссылки на видео")
 

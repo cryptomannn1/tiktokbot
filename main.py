@@ -13,7 +13,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
 
 from config import BOT_TOKEN, MAX_FILE_SIZE, ADMIN_ID
-from downloader import download_tiktok, download_twitter, download_instagram, compress_video, cleanup
+from downloader import download_tiktok, download_twitter, download_instagram, compress_video, ensure_telegram_compatible, cleanup
 from db import track_user, increment_downloads, get_stats, get_all_users
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -162,7 +162,10 @@ async def handle_message(message: Message):
                 size_mb = file_size / (1024 * 1024)
                 await status.edit_text(f"🗜 Видео {size_mb:.0f} МБ — сжимаю...")
                 path = await compress_video(path)
-                result["path"] = path
+            else:
+                # HEVC/VP9/10-bit → H.264, иначе Telegram показывает артефакты
+                path = await ensure_telegram_compatible(path)
+            result["path"] = path
         except RuntimeError as e:
             await status.edit_text(f"❌ Ошибка: {e}")
             cleanup(result["path"])
