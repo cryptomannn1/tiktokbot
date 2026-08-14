@@ -11,15 +11,27 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import CommandStart, Command
 from aiogram.enums import ParseMode
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 
-from config import BOT_TOKEN, MAX_FILE_SIZE, ADMIN_ID
+from config import BOT_TOKEN, MAX_FILE_SIZE, ADMIN_ID, TELEGRAM_API_URL
 from downloader import download_tiktok, download_twitter, download_instagram, compress_video, ensure_telegram_compatible, cleanup
 from db import track_user, increment_downloads, get_stats, get_all_users
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-bot = Bot(token=BOT_TOKEN)
+if TELEGRAM_API_URL:
+    # Загрузка до 2 ГБ идёт долго — таймаут сессии больше дефолтного
+    bot = Bot(
+        token=BOT_TOKEN,
+        session=AiohttpSession(
+            api=TelegramAPIServer.from_base(TELEGRAM_API_URL),
+            timeout=600,
+        ),
+    )
+else:
+    bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # Regex паттерны — без захвата замыкающей пунктуации
@@ -229,13 +241,10 @@ async def handle_message(message: Message):
 async def main():
     log.info("Бот запущен")
     try:
+        api_mode = f"локальный Bot API ({TELEGRAM_API_URL})" if TELEGRAM_API_URL else "облачный Bot API (лимит 50 МБ)"
         await bot.send_message(
             ADMIN_ID,
-            "✅ Бот перезапущен!\n\n"
-            "Что нового:\n"
-            "• Автоматическое сжатие видео > 50 МБ\n"
-            "• Улучшена стабильность загрузки\n"
-            "• Исправлены ошибки"
+            f"✅ Бот перезапущен!\nРежим: {api_mode}"
         )
     except Exception as e:
         log.warning("Не удалось отправить уведомление админу: %s", e)
