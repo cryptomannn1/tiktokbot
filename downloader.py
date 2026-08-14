@@ -381,13 +381,34 @@ async def download_tiktok(url: str) -> dict | None:
         return await _ytdlp_download(url, f"tt_{file_id}.mp4")
 
 
+async def _can_decode(filepath: str) -> bool:
+    """Проверить, что ffmpeg реально декодирует видео (один кадр).
+
+    hdplay с tikwm часто в ByteVC2 — TikTok-проприетарном кодеке, который
+    не читает ни ffmpeg, ни Telegram. Контейнер при этом парсится, так что
+    надёжный тест — только попытка декодирования.
+    """
+    cmd = [FFMPEG, "-v", "error", "-i", filepath, "-frames:v", "1", "-f", "null", "-"]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        await asyncio.wait_for(process.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        process.kill()
+        return False
+    return process.returncode == 0
+
+
 async def _tiktok_via_tikwm(url: str) -> dict | None:
     async with httpx.AsyncClient(
         timeout=30, follow_redirects=True, headers=_TIKWM_HEADERS
     ) as client:
         resp = await client.get(
             "https://www.tikwm.com/api/",
-            params={"url": url},
+            params={"url": url, "hd": 1},
         )
         if resp.status_code != 200:
             raise ConnectionError(f"tikwm HTTP {resp.status_code}")
@@ -397,20 +418,37 @@ async def _tiktok_via_tikwm(url: str) -> dict | None:
             raise RuntimeError(data.get("msg", "Не удалось получить видео"))
 
         video = data["data"]
-        # hdplay с tikwm часто отдаёт ByteVC2 (bvc2) — TikTok-проприетарный кодек,
-        # который не декодирует ни ffmpeg, ни Telegram. play = обычный H.264.
-        video_url = video.get("play") or video.get("hdplay")
-        if not video_url:
-            raise RuntimeError("Нет ссылки на видео")
 
-        if video_url.startswith("//"):
-            video_url = "https:" + video_url
+        def _normalize(u: str | None) -> str | None:
+            return "https:" + u if u and u.startswith("//") else u
+
+        hd_url = _normalize(video.get("hdplay"))
+        sd_url = _normalize(video.get("play"))
+        if not hd_url and not sd_url:
+            raise RuntimeError("Нет ссылки на видео")
 
         # UUID-префикс: два юзера с одним видео не должны перезаписать файл друг друга
         video_id = video.get("id", "")
-        filepath = await _download_file(
-            client, video_url, f"tt_{uuid.uuid4().hex[:8]}_{video_id}.mp4"
-        )
+        prefix = f"tt_{uuid.uuid4().hex[:8]}_{video_id}"
+
+        # Сначала пробуем HD; если кодек нечитаемый (ByteVC2) или HD не скачался —
+        # откатываемся на SD (play, обычный H.264).
+        filepath = None
+        if hd_url:
+            try:
+                filepath = await _download_file(client, hd_url, f"{prefix}_hd.mp4")
+                if not await _can_decode(filepath):
+                    log.info("hdplay не декодируется (ByteVC2?) — беру SD")
+                    _safe_remove(filepath)
+                    filepath = None
+            except Exception as e:
+                log.warning("hdplay не скачался (%s) — беру SD", e)
+                filepath = None
+
+        if filepath is None:
+            if not sd_url:
+                raise RuntimeError("Не удалось скачать видео")
+            filepath = await _download_file(client, sd_url, f"{prefix}.mp4")
 
         return {
             "path": filepath,
